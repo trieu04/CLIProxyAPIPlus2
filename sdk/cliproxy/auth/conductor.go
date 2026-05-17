@@ -161,8 +161,8 @@ const (
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
 	// burn CPU at idle.
 	refreshIneffectiveBackoff = 30 * time.Second
-	quotaBackoffBase          = time.Second
-	quotaBackoffMax           = 30 * time.Minute
+	quotaBackoffBase          = 1 * time.Minute
+	quotaBackoffMax           = 1 * time.Hour
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -748,6 +748,26 @@ func (m *Manager) ProvidersForRouteModel(routeModel string) []string {
 	return providers
 }
 
+// ResolveProvidersForFallback returns providers for a fallback model when the original model
+// has no matching provider. It consults the fallback-models map first, then the fallback-chain,
+// and returns the first set of providers found along with the matched model name.
+func (m *Manager) ResolveProvidersForFallback(originalModel string) ([]string, string) {
+	if m == nil {
+		return nil, ""
+	}
+	for _, fbModel := range m.resolveFallbackModels(originalModel) {
+		providers := m.ProvidersForRouteModel(fbModel)
+		if len(providers) > 0 {
+			return providers, fbModel
+		}
+		providers = m.ProvidersForOAuthAliasWithoutRegisteredModels(fbModel)
+		if len(providers) > 0 {
+			return providers, fbModel
+		}
+	}
+	return nil, ""
+}
+
 // ProvidersForOAuthAliasWithoutRegisteredModels returns provider keys for active non-API-key
 // auths whose OAuth alias table can resolve the requested route model even when the registry
 // does not yet advertise any models for that auth.
@@ -922,7 +942,7 @@ func countRemainingProviderOptions(currentProvider string, providers []string, t
 
 func shouldPreserveAttemptBudgetForStatus(statusCode int) bool {
 	switch statusCode {
-	case http.StatusTooManyRequests, http.StatusGatewayTimeout:
+	case http.StatusTooManyRequests, http.StatusGatewayTimeout, http.StatusServiceUnavailable:
 		return true
 	default:
 		return false
@@ -1134,6 +1154,10 @@ func apiKeyRegistryAliasKeys(cfg *internalconfig.Config, auth *Auth, targets ...
 		}
 	case "vertex":
 		if entry := resolveVertexAPIKeyConfig(cfg, auth); entry != nil {
+			return configModelAliasKeysMatchingUpstream(entry.Models, targets...)
+		}
+	case "ollama":
+		if entry := resolveOllamaAPIKeyConfig(cfg, auth); entry != nil {
 			return configModelAliasKeysMatchingUpstream(entry.Models, targets...)
 		}
 	default:
@@ -1476,6 +1500,10 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 			}
 		case "vertex":
 			if entry := resolveVertexAPIKeyConfig(cfg, auth); entry != nil {
+				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+			}
+		case "ollama":
+			if entry := resolveOllamaAPIKeyConfig(cfg, auth); entry != nil {
 				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
 			}
 		default:
@@ -2522,6 +2550,8 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 		upstreamModel = resolveUpstreamModelForCodexAPIKey(cfg, auth, requestedModel)
 	case "vertex":
 		upstreamModel = resolveUpstreamModelForVertexAPIKey(cfg, auth, requestedModel)
+	case "ollama":
+		upstreamModel = resolveUpstreamModelForOllamaAPIKey(cfg, auth, requestedModel)
 	default:
 		upstreamModel = resolveUpstreamModelForOpenAICompatAPIKey(cfg, auth, requestedModel)
 	}
@@ -2604,6 +2634,21 @@ func resolveVertexAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internal
 		return nil
 	}
 	return resolveAPIKeyConfig(cfg.VertexCompatAPIKey, auth)
+}
+
+func resolveOllamaAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalconfig.OllamaKey {
+	if cfg == nil {
+		return nil
+	}
+	return resolveAPIKeyConfig(cfg.OllamaKey, auth)
+}
+
+func resolveUpstreamModelForOllamaAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
+	entry := resolveOllamaAPIKeyConfig(cfg, auth)
+	if entry == nil {
+		return ""
+	}
+	return resolveModelAliasFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
 }
 
 func resolveUpstreamModelForGeminiAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
@@ -3272,6 +3317,40 @@ func statusCodeFromError(err error) int {
 		return sc.StatusCode()
 	}
 	return 0
+}
+
+func isUnauthorizedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if statusCodeFromError(err) == http.StatusUnauthorized {
+		return true
+	}
+	raw := strings.ToLower(err.Error())
+	return strings.Contains(raw, "status 401") || strings.Contains(raw, "401 unauthorized")
+}
+
+func hasUnauthorizedAuthFailure(auth *Auth) bool {
+	if auth == nil || auth.LastError == nil {
+		return false
+	}
+	return auth.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(auth.LastError.Code, "unauthorized")
+}
+
+func refreshErrorFromError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	statusCode := statusCodeFromError(err)
+	if statusCode == 0 && isUnauthorizedError(err) {
+		statusCode = http.StatusUnauthorized
+	}
+	authErr := &Error{Message: err.Error(), HTTPStatus: statusCode}
+	if statusCode == http.StatusUnauthorized {
+		authErr.Code = "unauthorized"
+		authErr.Retryable = false
+	}
+	return authErr
 }
 
 func retryAfterFromError(err error) *time.Duration {
@@ -4125,6 +4204,79 @@ func setHomeUserAPIKeyOnGinContext(ctx context.Context, apiKey string) {
 	ginCtx.Set("userApiKey", apiKey)
 }
 
+func homeDispatchHeaders(ctx context.Context, headers http.Header) http.Header {
+	apiKey, ok := homeQueryCredentialFromContext(ctx)
+	if !ok {
+		return headers
+	}
+	out := headers.Clone()
+	if out == nil {
+		out = http.Header{}
+	}
+	if out.Get("Authorization") != "" || out.Get("X-Goog-Api-Key") != "" || out.Get("X-Api-Key") != "" {
+		return out
+	}
+	out.Set("X-Goog-Api-Key", apiKey)
+	return out
+}
+
+func homeQueryCredentialFromContext(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	if queryCtx, ok := ctx.Value("gin").(interface{ Query(string) string }); ok && queryCtx != nil {
+		if apiKey := strings.TrimSpace(queryCtx.Query("key")); apiKey != "" {
+			return apiKey, true
+		}
+		if apiKey := strings.TrimSpace(queryCtx.Query("auth_token")); apiKey != "" {
+			return apiKey, true
+		}
+	}
+	ginCtx, ok := ctx.Value("gin").(interface{ Get(string) (any, bool) })
+	if !ok || ginCtx == nil {
+		return "", false
+	}
+	rawMetadata, ok := ginCtx.Get("accessMetadata")
+	if !ok {
+		return "", false
+	}
+	source := accessMetadataSource(rawMetadata)
+	if source != "query-key" && source != "query-auth-token" {
+		return "", false
+	}
+	rawAPIKey, ok := ginCtx.Get("userApiKey")
+	if !ok {
+		return "", false
+	}
+	apiKey := contextStringValue(rawAPIKey)
+	if apiKey == "" {
+		return "", false
+	}
+	return apiKey, true
+}
+
+func accessMetadataSource(raw any) string {
+	switch v := raw.(type) {
+	case map[string]string:
+		return strings.TrimSpace(v["source"])
+	case map[string]any:
+		return contextStringValue(v["source"])
+	default:
+		return ""
+	}
+}
+
+func contextStringValue(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
+	}
+}
+
 func homeExecutionSessionIDFromMetadata(meta map[string]any) string {
 	if len(meta) == 0 {
 		return ""
@@ -4246,8 +4398,9 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 
 	requestedModel := requestedModelFromMetadata(opts.Metadata, model)
 	sessionID := ExtractSessionID(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	dispatchHeaders := homeDispatchHeaders(ctx, opts.Headers)
 
-	raw, err := client.RPopAuth(ctx, requestedModel, sessionID, opts.Headers, count)
+	raw, err := client.RPopAuth(ctx, requestedModel, sessionID, dispatchHeaders, count)
 	if err != nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: err.Error(), HTTPStatus: http.StatusServiceUnavailable}
 	}
@@ -4608,6 +4761,9 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil {
 		return false
 	}
+	if hasUnauthorizedAuthFailure(a) {
+		return false
+	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
 		return false
 	}
@@ -4852,11 +5008,19 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		unauthorized := isUnauthorizedError(err)
 		shouldReschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			current.LastError = &Error{Message: err.Error()}
+			current.LastError = refreshErrorFromError(err)
+			if unauthorized {
+				current.NextRefreshAfter = time.Time{}
+				current.Unavailable = true
+				current.Status = StatusError
+				current.StatusMessage = "unauthorized"
+			} else {
+				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+			}
 			m.auths[id] = current
 			shouldReschedule = true
 			if m.scheduler != nil {
@@ -5134,27 +5298,42 @@ func (m *Manager) fallbackSourceForModel(originalModel, fbModel string) string {
 	return "fallback-chain"
 }
 
-func logRouteModelFallbackAttempt(ctx context.Context, originalModel, fallbackModel, source string, err error) {
+func logRouteModelFallbackResult(ctx context.Context, originalModel, fallbackModel, source string, triggerErr, resultErr error, startedAt time.Time) {
 	fields := log.Fields{
-		"requested_model": strings.TrimSpace(originalModel),
-		"fallback_model":  strings.TrimSpace(fallbackModel),
-		"fallback_source": strings.TrimSpace(source),
+		"requested_model":         strings.TrimSpace(originalModel),
+		"selected_fallback_model": strings.TrimSpace(fallbackModel),
+		"fallback_source":         strings.TrimSpace(source),
 	}
-	if status := statusCodeFromError(err); status > 0 {
-		fields["upstream_status"] = status
+	if !startedAt.IsZero() {
+		fields["elapsed_ms"] = time.Since(startedAt).Milliseconds()
 	}
-	if err != nil {
-		fields["fallback_reason"] = err.Error()
+	if status := statusCodeFromError(triggerErr); status > 0 {
+		fields["fallback_trigger_status"] = status
 	}
-	logEntryWithRequestID(ctx).WithFields(fields).Warn("routing request through fallback model")
-}
-
-func logRouteModelFallbackSuccess(ctx context.Context, originalModel, fallbackModel, source string) {
-	logEntryWithRequestID(ctx).WithFields(log.Fields{
-		"requested_model": strings.TrimSpace(originalModel),
-		"fallback_model":  strings.TrimSpace(fallbackModel),
-		"fallback_source": strings.TrimSpace(source),
-	}).Info("fallback model request completed")
+	if triggerErr != nil {
+		fields["fallback_trigger_error"] = triggerErr.Error()
+	}
+	provider, authID, authLabel := GetProviderAuthFromContext(ctx)
+	if trimmed := strings.TrimSpace(provider); trimmed != "" {
+		fields["selected_provider"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(authID); trimmed != "" {
+		fields["selected_auth_id"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(authLabel); trimmed != "" {
+		fields["selected_auth_label"] = trimmed
+	}
+	if resultErr != nil {
+		fields["outcome"] = "error"
+		if status := statusCodeFromError(resultErr); status > 0 {
+			fields["fallback_result_status"] = status
+		}
+		fields["fallback_result_error"] = resultErr.Error()
+		logEntryWithRequestID(ctx).WithFields(fields).Warn("fallback model request finished")
+		return
+	}
+	fields["outcome"] = "success"
+	logEntryWithRequestID(ctx).WithFields(fields).Info("fallback model request finished")
 }
 
 func (m *Manager) executeWithRouteFallback(
@@ -5187,16 +5366,17 @@ func (m *Manager) executeWithRouteFallback(
 		attempted[fbModel] = struct{}{}
 
 		source := m.fallbackSourceForModel(originalModel, fbModel)
-		logRouteModelFallbackAttempt(ctx, originalModel, fbModel, source, lastErr)
+		attemptStartedAt := time.Now()
 
 		fbReq := req
 		fbReq.Model = fbModel
 
 		resp, err := m.executeWithRetry(ctx, providers, fbReq, opts, maxRetryCredentials, maxWait, execOnce)
 		if err == nil {
-			logRouteModelFallbackSuccess(ctx, originalModel, fbModel, source)
+			logRouteModelFallbackResult(ctx, originalModel, fbModel, source, lastErr, nil, attemptStartedAt)
 			return resp, nil
 		}
+		logRouteModelFallbackResult(ctx, originalModel, fbModel, source, lastErr, err, attemptStartedAt)
 		lastErr = err
 		if !m.shouldAllowRouteModelFallback(err) {
 			break
@@ -5236,16 +5416,17 @@ func (m *Manager) executeStreamWithRouteFallback(
 		attempted[fbModel] = struct{}{}
 
 		source := m.fallbackSourceForModel(originalModel, fbModel)
-		logRouteModelFallbackAttempt(ctx, originalModel, fbModel, source, lastErr)
+		attemptStartedAt := time.Now()
 
 		fbReq := req
 		fbReq.Model = fbModel
 
 		result, err := m.executeStreamWithRetry(ctx, providers, fbReq, opts, maxRetryCredentials, maxWait, execOnce)
 		if err == nil {
-			logRouteModelFallbackSuccess(ctx, originalModel, fbModel, source)
+			logRouteModelFallbackResult(ctx, originalModel, fbModel, source, lastErr, nil, attemptStartedAt)
 			return result, nil
 		}
+		logRouteModelFallbackResult(ctx, originalModel, fbModel, source, lastErr, err, attemptStartedAt)
 		lastErr = err
 		if !m.shouldAllowRouteModelFallback(err) {
 			break

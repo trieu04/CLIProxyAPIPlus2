@@ -126,7 +126,7 @@ func newDefaultAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewGeminiAuthenticator(),
 		sdkAuth.NewCodexAuthenticator(),
 		sdkAuth.NewClaudeAuthenticator(),
-		sdkAuth.NewQwenAuthenticator(),
+		sdkAuth.NewXAIAuthenticator(),
 		sdkAuth.NewGitLabAuthenticator(),
 	)
 }
@@ -447,6 +447,8 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewOllamaExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
+	case "xai":
+		s.coreManager.RegisterExecutor(executor.NewXAIExecutor(s.cfg))
 	case "kiro":
 		s.coreManager.RegisterExecutor(executor.NewKiroExecutor(s.cfg))
 	case "cline":
@@ -584,6 +586,9 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	if s.coreManager != nil {
 		s.coreManager.SetConfig(newCfg)
 		s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
+	}
+	if newCfg.Home.Enabled {
+		s.registerHomeExecutors()
 	}
 	s.rebindExecutors()
 }
@@ -1250,6 +1255,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = applyExcludedModels(models, excluded)
 	case "kimi":
 		models = registry.GetKimiModels()
+		models = applyExcludedModels(models, excluded)
+	case "xai":
+		models = registry.GetXAIModels()
 		models = applyExcludedModels(models, excluded)
 	case "cursor":
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
