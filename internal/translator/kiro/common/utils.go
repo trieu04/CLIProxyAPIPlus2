@@ -2,11 +2,11 @@
 package common
 
 import (
+	"crypto/rand"
 	"strings"
-
-	"github.com/google/uuid"
-	log "github.com/sirupsen/logrus"
 )
+
+const toolUseIDAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 
 // GetString safely extracts a string from a map.
 // Returns empty string if the key doesn't exist or the value is not a string.
@@ -22,40 +22,38 @@ func GetStringValue(m map[string]interface{}, key string) string {
 	return GetString(m, key)
 }
 
-// SanitizeToolUseID ensures tool_use.id matches Claude API pattern ^[a-zA-Z0-9_-]+$
-// Returns sanitized ID or generates new one if input is invalid.
-func SanitizeToolUseID(id string) string {
-	if id == "" {
-		return ""
+// GenerateToolUseID returns a Claude-compatible tool_use id.
+func GenerateToolUseID() string {
+	const randomLen = 12
+	b := make([]byte, randomLen)
+	if _, err := rand.Read(b); err != nil {
+		for i := range b {
+			b[i] = byte(i)
+		}
 	}
+	var out strings.Builder
+	out.Grow(len("toolu_") + randomLen)
+	out.WriteString("toolu_")
+	for _, v := range b {
+		out.WriteByte(toolUseIDAlphabet[int(v)%len(toolUseIDAlphabet)])
+	}
+	return out.String()
+}
 
-	var sanitized strings.Builder
-	sanitized.Grow(len(id))
-
+// SanitizeToolUseID keeps only characters accepted by Claude tool_use ids.
+func SanitizeToolUseID(id string) string {
+	var out strings.Builder
+	out.Grow(len(id))
 	for _, r := range id {
 		if (r >= 'a' && r <= 'z') ||
 			(r >= 'A' && r <= 'Z') ||
 			(r >= '0' && r <= '9') ||
 			r == '_' || r == '-' {
-			sanitized.WriteRune(r)
+			out.WriteRune(r)
 		}
 	}
-
-	result := sanitized.String()
-
-	if len(result) < 8 {
-		log.Warnf("kiro: tool_use.id '%s' sanitized to '%s' (too short), generating new ID", id, result)
+	if id != "" && out.Len() < 8 {
 		return GenerateToolUseID()
 	}
-
-	if result != id {
-		log.Warnf("kiro: tool_use.id sanitized: '%s' -> '%s'", id, result)
-	}
-
-	return result
-}
-
-// GenerateToolUseID creates a valid tool_use.id without hyphens
-func GenerateToolUseID() string {
-	return "toolu_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:12]
+	return out.String()
 }

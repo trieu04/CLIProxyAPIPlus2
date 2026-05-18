@@ -3,14 +3,14 @@ package main
 import (
 	"fmt"
 
-	cursorproto "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/cursor/proto"
+	cursorproto "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 func main() {
 	ecm := dynamicpb.NewMessage(cursorproto.Msg("ExecClientMessage"))
-	
+
 	// Try different field names
 	names := []string{
 		"mcp_result", "mcpResult", "McpResult", "MCP_RESULT",

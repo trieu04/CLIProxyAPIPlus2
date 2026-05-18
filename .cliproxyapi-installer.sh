@@ -7,9 +7,10 @@ set -euo pipefail
 REPO_DIR="$HOME/code/CLIProxyAPIPlus"
 PROD_DIR="$HOME/cliproxyapi"
 AUTH_DIR="$HOME/.cli-proxy-api"
+BACKUP_DIR="$HOME/.cliproxyapi-backups"
 SCRIPT_NAME="cliproxyapi-installer"
 PUSH_TO_ORIGIN="${PUSH_TO_ORIGIN:-1}"
-PUSH_TAGS="${PUSH_TAGS:-1}"
+CREATE_RELEASE="${CREATE_RELEASE:-1}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -24,68 +25,65 @@ log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "${CYAN}[STEP]${NC} $1"; }
 
-restore_stash() {
-    local stash_ref="$1"
-    if [[ -n "$stash_ref" ]]; then
-        git stash pop --index -q "$stash_ref" >/dev/null 2>&1 || true
-    fi
-}
+_STASH_REF=""
+_STASHED=0
 
-resolve_latest_release_tag() {
-    local tag
-    tag=$(git tag -l 'v*.*.*-*' --sort=-v:refname | head -1)
-    if [[ -n "$tag" ]]; then
-        echo "$tag"
-        return 0
-    fi
-
-    if command -v gh >/dev/null 2>&1; then
-        tag=$(gh release list --limit 100 --json tagName --jq '.[] | .tagName' 2>/dev/null \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$' \
-            | sort -Vr \
-            | head -1 || true)
-        if [[ -n "$tag" ]]; then
-            echo "$tag"
-            return 0
+_cleanup() {
+    local exit_code=$?
+    if [[ $_STASHED -eq 1 && -n "$_STASH_REF" ]]; then
+        log_warning "Restoring stashed changes after interruption..."
+        cd "$REPO_DIR" 2>/dev/null || true
+        if ! git stash pop 2>&1; then
+            log_error "Stash still pending. Run: cd $REPO_DIR && git stash pop"
         fi
     fi
-
-    return 1
+    exit "$exit_code"
 }
+trap _cleanup EXIT
 
 is_service_running() {
-    if systemctl --user is-active --quiet cliproxyapi.service 2>/dev/null; then
-        return 0
-    fi
-    return 1
+    systemctl --user is-active --quiet cliproxyapi.service 2>/dev/null
 }
 
 stop_service() {
     if is_service_running; then
         log_info "Stopping service..."
         systemctl --user stop cliproxyapi.service
+        for i in $(seq 1 10); do
+            if ! is_service_running; then
+                break
+            fi
+            sleep 1
+        done
     fi
 }
 
 stop_processes() {
     local pids
-    pids=$(pgrep -f "cli-proxy-api" 2>/dev/null || true)
+    pids=$(pgrep -f "$PROD_DIR/server" 2>/dev/null || true)
     if [[ -n "$pids" ]]; then
         log_info "Stopping processes..."
         echo "$pids" | while read -r pid; do
             [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
         done
-        sleep 2
+        for i in $(seq 1 10); do
+            if ! pgrep -f "$PROD_DIR/server" >/dev/null 2>&1; then
+                return 0
+            fi
+            sleep 1
+        done
+        log_warning "Processes did not terminate after 10s, sending SIGKILL..."
+        echo "$pids" | while read -r pid; do
+            [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null || true
+        done
+        sleep 1
     fi
 }
 
 generate_api_key() {
     local prefix="sk-"
-    local chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    local key=""
-    for i in {1..45}; do
-        key="${key}${chars:$((RANDOM % ${#chars})):1}"
-    done
+    local key
+    key=$(head -c 45 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 45)
     echo "${prefix}${key}"
 }
 
@@ -94,12 +92,13 @@ check_api_keys() {
     [[ ! -f "$config_file" ]] && return 1
     grep -q '"your-api-key-1"' "$config_file" && return 1
     grep -q '"your-api-key-2"' "$config_file" && return 1
-    grep -A 10 "^api-keys:" "$config_file" | grep -q '"sk-[^"]*"' && return 0
+    grep -qE '^api-keys:' "$config_file" || return 1
+    grep -qE '^[^#]*"sk-[A-Za-z0-9]+"' "$config_file" && return 0
     return 1
 }
 
 git_sync() {
-    log_step "Git Sync (upstream)"
+    log_step "Git Sync (jc fork)"
 
     if [[ ! -d "$REPO_DIR/.git" ]]; then
         log_error "Repository not found at $REPO_DIR"
@@ -109,85 +108,102 @@ git_sync() {
 
     cd "$REPO_DIR"
 
-    local stashed=0
-    local stash_ref=""
     if [[ -n $(git status --porcelain 2>/dev/null) ]]; then
         log_info "Stashing uncommitted changes..."
-        git stash push -u -m "${SCRIPT_NAME}-autostash-$(date +%Y%m%d-%H%M%S)" >/dev/null
-        stash_ref="stash@{0}"
-        stashed=1
+        if git stash push -u -m "${SCRIPT_NAME}-autostash-$(date +%Y%m%d-%H%M%S)" 2>&1; then
+            _STASHED=1
+            _STASH_REF="1"
+        fi
     fi
 
-    log_info "Refreshing release tags from origin..."
+    local jc_remote="jc"
+    local jc_url="https://github.com/jc01rho/CLIProxyAPIPlus.git"
+
+    if ! git remote get-url "$jc_remote" &>/dev/null; then
+        log_info "Adding remote 'jc' -> $jc_url"
+        git remote add "$jc_remote" "$jc_url"
+    elif [[ "$(git remote get-url "$jc_remote")" != "$jc_url" ]]; then
+        log_info "Updating remote 'jc' -> $jc_url"
+        git remote set-url "$jc_remote" "$jc_url"
+    fi
+
     local fetch_timeout="${FETCH_TIMEOUT:-120}"
-    if ! GIT_TERMINAL_PROMPT=0 timeout "$fetch_timeout" git fetch origin --tags --prune 2>/dev/null; then
-        log_warning "Failed to refresh origin tags (timeout=${fetch_timeout}s). Continuing with local/gh tag cache."
-    else
-        log_success "Refreshed origin tags"
-    fi
-
-    local latest_tag
-    latest_tag=$(resolve_latest_release_tag || true)
-    if [[ -z "$latest_tag" ]]; then
-        log_error "No stable tag found matching v*.*.*-*"
+    log_info "Fetching from jc..."
+    if ! GIT_TERMINAL_PROMPT=0 timeout "$fetch_timeout" git fetch "$jc_remote" 2>&1; then
+        log_error "Failed to fetch from jc (timeout=${fetch_timeout}s)"
         exit 1
     fi
-    log_info "Latest release tag: $latest_tag"
+    log_success "Fetched from jc"
 
-    log_info "Merging $latest_tag..."
-    if ! git merge "$latest_tag" --no-edit; then
+    log_info "Merging jc/main with -X theirs..."
+    if ! git merge "$jc_remote/main" --no-edit -X theirs; then
+        git merge --abort 2>/dev/null || true
         log_error "Merge conflict detected. Manual resolution required."
-        log_info "Run: cd $REPO_DIR && git status"
+        log_info "Run: cd $REPO_DIR && git merge jc/main -X theirs"
         exit 1
     fi
-    
-    local commits_since_tag
-    commits_since_tag=$(git rev-list --count "${latest_tag}..HEAD")
-    local has_new_commits=0
-    [[ "$commits_since_tag" -gt 0 ]] && has_new_commits=1
-    
-    log_success "Merged $latest_tag"
 
-    if [[ "$PUSH_TO_ORIGIN" == "1" ]] && [[ $has_new_commits -eq 1 ]]; then
-        log_info "Pushing to origin..."
-        git push origin main
-        log_success "Pushed to origin"
-    elif [[ "$PUSH_TO_ORIGIN" == "1" ]]; then
-        log_info "No new commits to push"
+    log_success "Merged jc/main"
+
+    if [[ $_STASHED -eq 1 && -n "$_STASH_REF" ]]; then
+        log_info "Restoring stashed changes..."
+        if ! git stash pop 2>&1; then
+            log_warning "Failed to restore stashed changes. They remain in the stash stack."
+            log_info "Run: cd $REPO_DIR && git stash pop"
+        fi
+        _STASHED=0
+        _STASH_REF=""
     fi
 
-    if [[ "$PUSH_TAGS" == "1" ]] && [[ $has_new_commits -eq 1 ]]; then
-        log_info "Creating and pushing release tag..."
-        local base_version patch_num
-        if [[ "$latest_tag" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)$ ]]; then
+    if [[ "$PUSH_TO_ORIGIN" == "1" ]]; then
+        log_info "Pushing to origin..."
+        if ! git push origin main 2>&1; then
+            log_warning "Failed to push to origin. Continuing."
+        else
+            log_success "Pushed to origin"
+        fi
+    fi
+
+    if [[ "$CREATE_RELEASE" == "1" ]]; then
+        log_info "Creating release tag..."
+        local latest_tag new_tag base_version patch_num
+        latest_tag=$(git tag -l 'v*.*.*-*' --sort=-v:refname | head -1)
+        if [[ -z "$latest_tag" ]]; then
+            latest_tag=$(git tag -l 'v*.*.*' --sort=-v:refname | head -1)
+            if [[ -n "$latest_tag" ]]; then
+                new_tag="${latest_tag}-1"
+            fi
+        elif [[ "$latest_tag" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)$ ]]; then
             base_version="${BASH_REMATCH[1]}"
             patch_num="${BASH_REMATCH[2]}"
-        else
-            log_error "Unexpected release tag format: $latest_tag"
-            exit 1
+            new_tag="${base_version}-$((patch_num + 1))"
         fi
-        local new_tag="${base_version}-$((patch_num + 1))"
-        
-        if git tag -a "$new_tag" -m "Release $new_tag" 2>/dev/null; then
-            git push origin "$new_tag"
-            log_success "Created and pushed tag: $new_tag"
+
+        if [[ -z "${new_tag:-}" ]]; then
+            log_warning "No existing tags found, skipping release"
+        elif git tag -a "$new_tag" -m "Release $new_tag" 2>&1; then
+            log_success "Created tag: $new_tag"
+            if git push origin "$new_tag" 2>&1; then
+                log_success "Pushed tag $new_tag — GoReleaser workflow triggered"
+            else
+                log_warning "Failed to push tag $new_tag"
+            fi
         else
             log_warning "Tag $new_tag already exists"
         fi
-    elif [[ "$PUSH_TAGS" == "1" ]]; then
-        log_info "No new commits, skipping tag creation"
-    fi
-
-    if [[ $stashed -eq 1 ]]; then
-        log_info "Restoring stashed changes..."
-        restore_stash "$stash_ref"
     fi
 }
 
 build_binary() {
     log_step "Building from source"
+
+    if ! command -v go &>/dev/null; then
+        log_error "Go compiler not found. Install Go 1.26+ first."
+        exit 1
+    fi
+
     cd "$REPO_DIR"
-    
+
     log_info "Running go build..."
     if ! go build -o server ./cmd/server; then
         log_error "Build failed"
@@ -198,34 +214,38 @@ build_binary() {
 
 deploy() {
     log_step "Deploying to $PROD_DIR"
-    
+
     mkdir -p "$PROD_DIR"
-    
-    log_info "Backing up config..."
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+
     if [[ -f "$PROD_DIR/config.yaml" ]]; then
-        mkdir -p "$PROD_DIR/config_backup"
-        chmod 700 "$PROD_DIR/config_backup"
+        log_info "Backing up config..."
         local ts
         ts=$(date +"%Y%m%d_%H%M%S")
-        cp "$PROD_DIR/config.yaml" "$PROD_DIR/config_backup/config_${ts}.yaml"
+        cp "$PROD_DIR/config.yaml" "$BACKUP_DIR/config_${ts}.yaml"
     fi
-    
-    log_info "Backing up auth tokens..."
+
     if [[ -d "$AUTH_DIR" ]]; then
-        mkdir -p "$PROD_DIR/config_backup"
-        chmod 700 "$PROD_DIR/config_backup"
-        local token_ts
-        token_ts=$(date +"%Y%m%d_%H%M")
-        tar -czf "$PROD_DIR/config_backup/tokens_${token_ts}.tar.gz" -C "$AUTH_DIR" . 2>/dev/null || true
+        log_info "Backing up auth tokens..."
+        local ts
+        ts=$(date +"%Y%m%d_%H%M%S")
+        tar -czf "$BACKUP_DIR/tokens_${ts}.tar.gz" -C "$AUTH_DIR" . 2>/dev/null || true
     fi
-    
+
+    log_info "Pruning old backups (keeping last 10)..."
+    while IFS= read -r -d '' f; do rm -f "$f"; done < <(find "$BACKUP_DIR" -maxdepth 1 -name 'config_*.yaml' -printf '%T@ %p\0' 2>/dev/null | sort -znr | tail -n +11 | cut -z -d' ' -f2-)
+    while IFS= read -r -d '' f; do rm -f "$f"; done < <(find "$BACKUP_DIR" -maxdepth 1 -name 'tokens_*.tar.gz' -printf '%T@ %p\0' 2>/dev/null | sort -znr | tail -n +11 | cut -z -d' ' -f2-)
+
+    # Atomic binary replacement: backup old, stage new, then swap
     if [[ -f "$PROD_DIR/server" ]]; then
-        mv "$PROD_DIR/server" "$PROD_DIR/server.backup"
+        cp "$PROD_DIR/server" "$PROD_DIR/server.backup"
     fi
-    
-    cp "$REPO_DIR/server" "$PROD_DIR/"
-    chmod +x "$PROD_DIR/server"
-    
+    cp "$REPO_DIR/server" "$PROD_DIR/server.new"
+    chmod +x "$PROD_DIR/server.new"
+    # mv is atomic on same filesystem (ext4/xfs) — no window without a binary
+    mv "$PROD_DIR/server.new" "$PROD_DIR/server"
+
     if [[ ! -f "$PROD_DIR/config.yaml" ]]; then
         cp "$REPO_DIR/config.example.yaml" "$PROD_DIR/config.yaml"
         local key1 key2
@@ -235,7 +255,7 @@ deploy() {
         sed -i "s|\"your-api-key-2\"|\"$key2\"|g" "$PROD_DIR/config.yaml"
         log_success "Created config.yaml with generated API keys"
     fi
-    
+
     log_success "Deployed to $PROD_DIR"
 }
 
@@ -265,18 +285,21 @@ EOF
 
 start_service() {
     log_step "Starting service"
-    
+
     create_systemd_service
-    
+
     systemctl --user enable cliproxyapi.service 2>/dev/null || true
     systemctl --user restart cliproxyapi.service
-    sleep 3
-    
-    if is_service_running; then
-        log_success "Service is running"
-    else
-        log_warning "Service not running, check logs: journalctl --user -u cliproxyapi.service"
-    fi
+
+    for i in $(seq 1 10); do
+        if is_service_running; then
+            log_success "Service is running"
+            return 0
+        fi
+        sleep 1
+    done
+
+    log_warning "Service not running, check logs: journalctl --user -u cliproxyapi.service"
 }
 
 show_status() {
@@ -287,7 +310,7 @@ show_status() {
     echo "Install Dir: $PROD_DIR"
     echo "Auth Dir:    $AUTH_DIR"
     echo
-    [[ -f "$PROD_DIR/server" ]] && echo "Binary:      Present" || echo "Binary:      Missing"
+    [[ -x "$PROD_DIR/server" ]] && echo "Binary:      Present" || echo "Binary:      Missing"
     [[ -f "$PROD_DIR/config.yaml" ]] && echo "Config:      Present" || echo "Config:      Missing"
     check_api_keys && echo "API Keys:    Configured" || echo "API Keys:    NOT CONFIGURED"
     echo
@@ -309,12 +332,12 @@ main() {
             build_binary
             deploy
             start_service
-            
+
             log_success "Installation complete!"
             echo
             log_info "Binary: $PROD_DIR/server"
             log_info "Config: $PROD_DIR/config.yaml"
-            
+
             if ! check_api_keys; then
                 echo
                 log_warning "Configure API keys: nano $PROD_DIR/config.yaml"
@@ -336,7 +359,7 @@ Commands:
 
 Environment:
   PUSH_TO_ORIGIN=0   Skip pushing to origin
-  PUSH_TAGS=0        Skip creating release tags
+  CREATE_RELEASE=0   Skip creating and pushing release tag
   FETCH_TIMEOUT=120  Git fetch timeout in seconds
 
 EOF
